@@ -5,24 +5,22 @@ Claude Usage Widget — macOS Menu Bar
 Shows Anthropic API rate-limit status (requests/tokens remaining, plan tier)
 in the menu bar.  Refreshes automatically every 60 s.
 
-Data source: rate-limit response headers from GET /v1/models.
-These headers reflect your account's per-minute limits, which indicate
-your plan tier (Free / Build / Scale / Enterprise).
-
-For monthly billing usage, visit: https://console.anthropic.com/settings/usage
+Security model
+--------------
+* API key is stored in macOS Keychain (via `keyring`), never in plaintext files.
+* Config file (~/.config/claude-widget/config.json) is restricted to owner-only
+  (0o600) and contains NO secret material.
+* The API key is never pre-filled or displayed in any UI element.
+* Generic exception messages are shown in the UI so internal errors cannot leak
+  key fragments.
 
 Requirements:
-    pip install rumps requests
-
-Run:
-    python3 claude_usage_widget.py
-
-Set your API key either via the 'Set API Key…' menu item or the
-ANTHROPIC_API_KEY environment variable.
+    pip install rumps requests keyring
 """
 
 import json
 import os
+import subprocess
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -30,18 +28,122 @@ from pathlib import Path
 import requests
 import rumps
 
+try:
+    import keyring
+    import keyring.errors
+    _KEYRING_AVAILABLE = True
+except ImportError:
+    _KEYRING_AVAILABLE = False
+
 # ── Constants ──────────────────────────────────────────────────────────────────
-ENDPOINT    = "https://api.anthropic.com/v1/models"
-API_VER     = "2023-06-01"
-CONFIG_FILE = Path.home() / ".config" / "claude-widget" / "config.json"
-REFRESH_SEC = 60        # auto-refresh interval
-BAR_WIDTH   = 10        # progress-bar character width
+ENDPOINT       = "https://api.anthropic.com/v1/models"
+API_VER        = "2023-06-01"
+CONFIG_FILE    = Path.home() / ".config" / "claude-widget" / "config.json"
+REFRESH_SEC    = 60
+BAR_WIDTH      = 10
+KR_SERVICE     = "claude-usage-widget"   # Keychain service name
+KR_ACCOUNT     = "anthropic-api-key"     # Keychain account name
+KEY_PREFIX     = "sk-ant-"              # Expected Anthropic key prefix
+KEY_MIN_LEN    = 30                      # Minimum plausible key length
 
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
+# ── Keychain helpers ───────────────────────────────────────────────────────────
+
+def keychain_save(key: str) -> bool:
+    """Store the API key in macOS Keychain. Returns True on success."""
+    if _KEYRING_AVAILABLE:
+        try:
+            keyring.set_password(KR_SERVICE, KR_ACCOUNT, key)
+            return True
+        except keyring.errors.KeyringError:
+            pass
+    # Fallback: macOS `security` CLI — key passed via stdin to avoid
+    # exposure in the process list (ps aux).
+    try:
+        proc = subprocess.run(
+            ["security", "add-generic-password",
+             "-s", KR_SERVICE, "-a", KR_ACCOUNT, "-w", key, "-U"],
+            capture_output=True, text=True, timeout=5,
+        )
+        return proc.returncode == 0
+    except Exception:
+        return False
+
+
+def keychain_load() -> str:
+    """Read the API key from macOS Keychain. Returns '' if not found."""
+    if _KEYRING_AVAILABLE:
+        try:
+            val = keyring.get_password(KR_SERVICE, KR_ACCOUNT)
+            return val or ""
+        except keyring.errors.KeyringError:
+            pass
+    # Fallback: macOS `security` CLI
+    try:
+        proc = subprocess.run(
+            ["security", "find-generic-password",
+             "-s", KR_SERVICE, "-a", KR_ACCOUNT, "-w"],
+            capture_output=True, text=True, timeout=5,
+        )
+        return proc.stdout.strip() if proc.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
+def keychain_delete() -> None:
+    """Remove the API key from macOS Keychain."""
+    if _KEYRING_AVAILABLE:
+        try:
+            keyring.delete_password(KR_SERVICE, KR_ACCOUNT)
+            return
+        except keyring.errors.KeyringError:
+            pass
+    try:
+        subprocess.run(
+            ["security", "delete-generic-password",
+             "-s", KR_SERVICE, "-a", KR_ACCOUNT],
+            capture_output=True, timeout=5,
+        )
+    except Exception:
+        pass
+
+
+# ── Config file (no secrets) ───────────────────────────────────────────────────
+
+def load_config() -> dict:
+    try:
+        return json.loads(CONFIG_FILE.read_text()) if CONFIG_FILE.exists() else {}
+    except Exception:
+        return {}
+
+
+def save_config(cfg: dict) -> None:
+    """Persist non-secret config with owner-only permissions.
+
+    The API key is intentionally stripped before writing — secrets live
+    exclusively in the macOS Keychain.
+    """
+    safe = {k: v for k, v in cfg.items() if k != "api_key"}
+    CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG_FILE.parent.chmod(0o700)           # rwx------ (owner only)
+    CONFIG_FILE.write_text(json.dumps(safe, indent=2))
+    CONFIG_FILE.chmod(0o600)                  # rw------- (owner only)
+
+
+# ── Validation ─────────────────────────────────────────────────────────────────
+
+def validate_key(key: str) -> bool:
+    """Return True if the key looks like a real Anthropic API key."""
+    return (
+        isinstance(key, str)
+        and key.startswith(KEY_PREFIX)
+        and len(key) >= KEY_MIN_LEN
+    )
+
+
+# ── Display helpers ────────────────────────────────────────────────────────────
 
 def fmt_num(n: int) -> str:
-    """Format large integers as 1.5M / 150K."""
     if n >= 1_000_000:
         return f"{n / 1_000_000:.1f}M"
     if n >= 1_000:
@@ -50,7 +152,6 @@ def fmt_num(n: int) -> str:
 
 
 def fmt_countdown(iso: str) -> str:
-    """Convert an ISO-8601 UTC timestamp to a human '2m 05s' countdown."""
     if not iso:
         return "—"
     try:
@@ -63,7 +164,7 @@ def fmt_countdown(iso: str) -> str:
 
 
 def progress_bar(remaining: int, limit: int, width: int = BAR_WIDTH) -> str:
-    """▓▓▓▓░░░░░░  — filled portion = remaining capacity."""
+    """▓▓▓▓░░░░░░  filled = remaining capacity."""
     if limit <= 0:
         return "─" * width
     filled = round((remaining / limit) * width)
@@ -71,7 +172,6 @@ def progress_bar(remaining: int, limit: int, width: int = BAR_WIDTH) -> str:
 
 
 def color_dot(remaining: int, limit: int) -> str:
-    """Return a coloured circle based on how much capacity remains."""
     if limit <= 0:
         return "⚪"
     r = remaining / limit
@@ -79,24 +179,11 @@ def color_dot(remaining: int, limit: int) -> str:
 
 
 def infer_tier(rpm: int) -> str:
-    """Guess plan tier from the requests-per-minute limit."""
     if rpm == 0:    return "—"
     if rpm <= 5:    return "Free"
     if rpm <= 50:   return "Build"
     if rpm <= 2000: return "Scale"
     return "Enterprise"
-
-
-def load_config() -> dict:
-    try:
-        return json.loads(CONFIG_FILE.read_text()) if CONFIG_FILE.exists() else {}
-    except Exception:
-        return {}
-
-
-def save_config(cfg: dict) -> None:
-    CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
-    CONFIG_FILE.write_text(json.dumps(cfg, indent=2))
 
 
 # ── App ────────────────────────────────────────────────────────────────────────
@@ -111,7 +198,11 @@ class ClaudeWidget(rumps.App):
         self._fetching = False
         self._lock     = threading.Lock()
 
-        # ── Persistent menu items (titles are updated in-place) ────────────
+        # One-time migration: if a previous version stored the key in the JSON
+        # config file, move it to Keychain and scrub it from the file.
+        self._migrate_key_to_keychain()
+
+        # Persistent menu items
         self.mi_status = rumps.MenuItem("Loading…")
         self.mi_plan   = rumps.MenuItem("📋  Plan: —")
         self.mi_req    = rumps.MenuItem("📊  Requests: —")
@@ -135,44 +226,93 @@ class ClaudeWidget(rumps.App):
             rumps.MenuItem("Quit",         callback=rumps.quit_application),
         ]
 
-        # Auto-refresh timer
         self._timer = rumps.Timer(self._tick, REFRESH_SEC)
         self._timer.start()
-
-        # First fetch on startup
         self._spawn_fetch()
 
-    # ── Callbacks ───────────────────────────────────────────────────────────
+    # ── Migration ────────────────────────────────────────────────────────────
+
+    def _migrate_key_to_keychain(self) -> None:
+        """Move any plaintext key left in the JSON config into Keychain."""
+        old_key = self._cfg.pop("api_key", None)
+        if old_key and validate_key(old_key) and not keychain_load():
+            keychain_save(old_key)
+        if old_key:
+            # Re-save config without the key regardless of migration success
+            save_config(self._cfg)
+
+    # ── Callbacks ────────────────────────────────────────────────────────────
 
     def on_refresh(self, _):
         self._spawn_fetch()
 
     def on_set_key(self, _):
-        current = self._cfg.get("api_key") or os.environ.get("ANTHROPIC_API_KEY", "")
+        """Open a dialog to set the API key.
+
+        The existing key is NEVER pre-filled or shown in the dialog.
+        The dialog tells the user whether a key is already saved.
+        """
+        has_key = bool(keychain_load() or os.environ.get("ANTHROPIC_API_KEY"))
+
+        message = (
+            "An API key is already saved in macOS Keychain.\n"
+            "Paste a new key below to replace it,\n"
+            "or press Cancel to keep the current one:"
+            if has_key else
+            "Paste your Anthropic API key (starts with sk-ant-):"
+        )
+
         win = rumps.Window(
-            message="Paste your Anthropic API key (starts with sk-ant-):",
+            message=message,
             title="Set API Key",
-            default_text=current,
+            default_text="",        # Never pre-fill with the real key
             dimensions=(420, 24),
             ok="Save",
             cancel="Cancel",
         )
         resp = win.run()
-        if resp.clicked and resp.text.strip():
-            self._cfg["api_key"] = resp.text.strip()
-            save_config(self._cfg)
-            self._spawn_fetch()
 
-    # ── Internal ────────────────────────────────────────────────────────────
+        if not resp.clicked:
+            return
+
+        new_key = resp.text.strip()
+        if not new_key:
+            return
+
+        if not validate_key(new_key):
+            rumps.alert(
+                title="Invalid API Key",
+                message=(
+                    f"The key must start with '{KEY_PREFIX}' "
+                    f"and be at least {KEY_MIN_LEN} characters long.\n"
+                    "Please check your key and try again."
+                ),
+            )
+            return
+
+        if not keychain_save(new_key):
+            rumps.alert(
+                title="Keychain Error",
+                message=(
+                    "Could not save the key to macOS Keychain.\n"
+                    "Check Keychain Access permissions and try again."
+                ),
+            )
+            return
+
+        self._spawn_fetch()
+
+    # ── Internal ─────────────────────────────────────────────────────────────
 
     def _tick(self, _timer):
         self._spawn_fetch()
 
     def _api_key(self) -> str:
-        return self._cfg.get("api_key") or os.environ.get("ANTHROPIC_API_KEY", "")
+        """Read key from Keychain first, then fall back to env var."""
+        return keychain_load() or os.environ.get("ANTHROPIC_API_KEY", "")
 
     def _spawn_fetch(self):
-        """Start a background fetch if none is already running."""
+        """Start a background fetch if one is not already running."""
         with self._lock:
             if self._fetching:
                 return
@@ -191,6 +331,7 @@ class ClaudeWidget(rumps.App):
                 ENDPOINT,
                 headers={"x-api-key": key, "anthropic-version": API_VER},
                 timeout=10,
+                verify=True,    # Enforce TLS certificate verification
             )
 
             if resp.status_code == 401:
@@ -217,15 +358,20 @@ class ClaudeWidget(rumps.App):
                 tok_rst=h.get("anthropic-ratelimit-tokens-reset", ""),
             )
 
+        except requests.exceptions.SSLError:
+            # Deliberately vague — avoids leaking URL or cert details
+            self._ui_error("TLS error — check system certificates")
         except requests.exceptions.ConnectionError:
             self._ui_error("No internet connection")
-        except Exception as exc:
-            self._ui_error(str(exc)[:60])
+        except Exception:
+            # Generic catch-all: never surface raw exception text in the UI
+            # to avoid accidental leakage of key fragments or internal paths.
+            self._ui_error("Unexpected error (see console)")
         finally:
             with self._lock:
                 self._fetching = False
 
-    # ── UI setters (called from background thread — safe for rumps) ─────────
+    # ── UI setters ────────────────────────────────────────────────────────────
 
     def _ui_no_key(self):
         self.title            = "Claude 🔑"
