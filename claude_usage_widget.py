@@ -36,8 +36,14 @@ except ImportError:
     _KEYRING_AVAILABLE = False
 
 # ── Constants ──────────────────────────────────────────────────────────────────
-ENDPOINT       = "https://api.anthropic.com/v1/models"
+ENDPOINT       = "https://api.anthropic.com/v1/messages"
 API_VER        = "2023-06-01"
+# Cheapest model + 1 output token so the probe costs ~$0.00001 per call.
+PROBE_PAYLOAD  = {
+    "model": "claude-haiku-4-5-20251001",
+    "max_tokens": 1,
+    "messages": [{"role": "user", "content": "hi"}],
+}
 CONFIG_FILE    = Path.home() / ".config" / "claude-widget" / "config.json"
 REFRESH_SEC    = 60
 BAR_WIDTH      = 10
@@ -327,9 +333,17 @@ class ClaudeWidget(rumps.App):
                 self._ui_no_key()
                 return
 
-            resp = requests.get(
+            # POST /v1/messages is the only endpoint that returns
+            # rate-limit headers. We use a 1-token Haiku probe to keep
+            # cost negligible (~$0.00001 per refresh).
+            resp = requests.post(
                 ENDPOINT,
-                headers={"x-api-key": key, "anthropic-version": API_VER},
+                headers={
+                    "x-api-key": key,
+                    "anthropic-version": API_VER,
+                    "content-type": "application/json",
+                },
+                json=PROBE_PAYLOAD,
                 timeout=10,
                 verify=True,    # Enforce TLS certificate verification
             )
